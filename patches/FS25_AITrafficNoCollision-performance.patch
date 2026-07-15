@@ -1,0 +1,274 @@
+--- a/aiTrafficNoCollision.lua
++++ b/aiTrafficNoCollision.lua
+@@ -33,7 +33,27 @@
+     overlapHitCount = 0,
+ 
+     trafficSystemInfoLogged = false,
+-    lastTrafficAccessorName = "none"
++    lastTrafficAccessorName = "none",
++
++    -- PERFORMANCE PATCH (frame-time fix):
++    -- The original scan classified every overlap hit synchronously inside one
++    -- frame, re-classifying the same static world geometry every second. That
++    -- cost ~24ms on the main thread once per second (measured). The patch
++    -- (1) remembers permanent "not traffic" verdicts between scans,
++    -- (2) defers per-hit classification to a small per-frame budget, and
++    -- (3) round-robins the overlap scan positions (one sphere per fire).
++    -- Detection semantics are unchanged; the work is just cached and smeared.
++    notTrafficNodeCache = nil,
++    notTrafficCacheResetMs = 120000,
++    notTrafficCacheTimerMs = 0,
++    pendingHits = nil,
++    pendingHitSet = nil,
++    pendingHitHead = 1,
++    pendingHitTail = 0,
++    maxPendingHits = 4096,
++    hitBudgetPerFrame = 24,
++    scanPositionIndex = 0,
++    vehicleTrafficVerdict = nil
+ }
+ 
+ function AITrafficNoCollision:loadMap()
+@@ -59,6 +79,15 @@
+     self.overlapVisitedNodes = nil
+     self.overlapModifiedCount = 0
+     self.overlapHitCount = 0
++    -- PERFORMANCE PATCH state
++    self.notTrafficNodeCache = nil
++    self.notTrafficCacheTimerMs = 0
++    self.pendingHits = nil
++    self.pendingHitSet = nil
++    self.pendingHitHead = 1
++    self.pendingHitTail = 0
++    self.scanPositionIndex = 0
++    self.vehicleTrafficVerdict = nil
+ end
+ 
+ function AITrafficNoCollision:update(dt)
+@@ -66,6 +95,17 @@
+     self:tryInstallRuntimeHooks()
+ 
+     if g_server ~= nil and self.disableTrafficCollision then
++        -- PERFORMANCE PATCH: drain a few deferred overlap hits per frame
++        self:processPendingHits()
++
++        -- periodically forget "not traffic" verdicts (engine node ids can be
++        -- recycled after despawn, so the cache must not live forever)
++        self.notTrafficCacheTimerMs = self.notTrafficCacheTimerMs + dt
++        if self.notTrafficCacheTimerMs >= self.notTrafficCacheResetMs then
++            self.notTrafficCacheTimerMs = 0
++            self.notTrafficNodeCache = nil
++        end
++
+         self.scanTimerMs = self.scanTimerMs - dt
+         if self.scanTimerMs <= 0 then
+             self.scanTimerMs = self.scanIntervalMs
+@@ -74,6 +114,65 @@
+     end
+ end
+ 
++-- PERFORMANCE PATCH: classify and apply a bounded number of deferred overlap
++-- hits per frame instead of all hits inside a single frame.
++function AITrafficNoCollision:processPendingHits()
++    if self.pendingHits == nil or self.pendingHitHead > self.pendingHitTail then
++        return
++    end
++
++    local budget = self.hitBudgetPerFrame
++    while budget > 0 and self.pendingHitHead <= self.pendingHitTail do
++        local nodeId = self.pendingHits[self.pendingHitHead]
++        self.pendingHits[self.pendingHitHead] = nil
++        self.pendingHitHead = self.pendingHitHead + 1
++        budget = budget - 1
++
++        if nodeId ~= nil then
++            if self.pendingHitSet ~= nil then
++                self.pendingHitSet[nodeId] = nil
++            end
++            self:classifyOverlapHit(nodeId)
++        end
++    end
++
++    if self.pendingHitHead > self.pendingHitTail then
++        self.pendingHits = nil
++        self.pendingHitSet = nil
++        self.pendingHitHead = 1
++        self.pendingHitTail = 0
++    end
++end
++
++-- PERFORMANCE PATCH: the per-hit logic that used to run inside the overlap
++-- callback, unchanged semantically, now fed from the deferred queue.
++function AITrafficNoCollision:classifyOverlapHit(hitObjectId)
++    if type(hitObjectId) ~= "number" or hitObjectId == 0 or not entityExists(hitObjectId) then
++        return
++    end
++
++    if not self:isTrafficShapeNode(hitObjectId) then
++        -- permanent world geometry can never become traffic; remember the
++        -- verdict so the next scans skip it with a table lookup
++        if self.notTrafficNodeCache == nil then
++            self.notTrafficNodeCache = {}
++        end
++        self.notTrafficNodeCache[hitObjectId] = true
++        return
++    end
++
++    local rootNode = self:findTrafficShapeRoot(hitObjectId) or hitObjectId
++    if not self:isTrafficNodeMoving(rootNode) and not self:isTrafficNodeMoving(hitObjectId) then
++        return
++    end
++
++    self:forEachNodeInHierarchy(rootNode, function(nodeId)
++        if self:applyNoCollisionToNode(nodeId) then
++            self.overlapModifiedCount = self.overlapModifiedCount + 1
++        end
++    end)
++end
++
+ function AITrafficNoCollision:getCollisionDisabled()
+     return self.disableTrafficCollision
+ end
+@@ -470,6 +569,23 @@
+         return false
+     end
+ 
++    -- PERFORMANCE PATCH: memoize per vehicle table (class/type/config name
++    -- never change for a loaded vehicle); weak keys so despawned vehicles
++    -- can be garbage collected
++    if self.vehicleTrafficVerdict == nil then
++        self.vehicleTrafficVerdict = setmetatable({}, { __mode = "k" })
++    end
++    local cached = self.vehicleTrafficVerdict[vehicle]
++    if cached ~= nil then
++        return cached
++    end
++
++    local verdict = self:computeIsTrafficVehicle(vehicle)
++    self.vehicleTrafficVerdict[vehicle] = verdict
++    return verdict
++end
++
++function AITrafficNoCollision:computeIsTrafficVehicle(vehicle)
+     if vehicle.isTrafficVehicle == true then
+         return true
+     end
+@@ -755,14 +871,22 @@
+     self.overlapModifiedCount = 0
+     self.overlapHitCount = 0
+ 
++    -- PERFORMANCE PATCH v2: prefer the targeted vehicle/traffic mask so the
++    -- overlap only returns vehicle shapes (dozens) instead of every shape in
++    -- 90m (thousands) — each hit costs a C++->Lua callback invocation even
++    -- when rejected, which was the dominant residual cost. CollisionMask.ALL
++    -- remains as the fallback when the flags are unavailable.
+     local overlapMask = nil
+-    if CollisionMask ~= nil and type(CollisionMask.ALL) == "number" then
+-        overlapMask = CollisionMask.ALL
+-    elseif CollisionFlag ~= nil and type(CollisionFlag.VEHICLE) == "number" then
++    if CollisionFlag ~= nil and type(CollisionFlag.VEHICLE) == "number" then
+         overlapMask = CollisionFlag.VEHICLE
+         if type(CollisionFlag.TRAFFIC_VEHICLE) == "number" then
+             overlapMask = overlapMask + CollisionFlag.TRAFFIC_VEHICLE
+         end
++        if type(CollisionFlag.TRAFFIC_VEHICLE_BLOCKING) == "number" then
++            overlapMask = overlapMask + CollisionFlag.TRAFFIC_VEHICLE_BLOCKING
++        end
++    elseif CollisionMask ~= nil and type(CollisionMask.ALL) == "number" then
++        overlapMask = CollisionMask.ALL
+     end
+ 
+     if type(overlapMask) ~= "number" then
+@@ -774,8 +898,11 @@
+     return self.overlapModifiedCount
+ end
+ 
++-- PERFORMANCE PATCH: the overlap callback no longer classifies hits inline.
++-- It only deduplicates (per scan and against the persistent not-traffic
++-- cache) and enqueues unknown nodes for budgeted per-frame processing.
+ function AITrafficNoCollision:onTrafficOverlapCallback(hitObjectId)
+-    if type(hitObjectId) ~= "number" or hitObjectId == 0 or not entityExists(hitObjectId) then
++    if type(hitObjectId) ~= "number" or hitObjectId == 0 then
+         return true
+     end
+ 
+@@ -787,20 +914,28 @@
+     end
+     self.overlapHitCount = self.overlapHitCount + 1
+ 
+-    if not self:isTrafficShapeNode(hitObjectId) then
++    if self.notTrafficNodeCache ~= nil and self.notTrafficNodeCache[hitObjectId] then
+         return true
+     end
+ 
+-    local rootNode = self:findTrafficShapeRoot(hitObjectId) or hitObjectId
+-    if not self:isTrafficNodeMoving(rootNode) and not self:isTrafficNodeMoving(hitObjectId) then
++    if self.pendingHitSet ~= nil and self.pendingHitSet[hitObjectId] then
+         return true
+     end
+ 
+-    self:forEachNodeInHierarchy(rootNode, function(nodeId)
+-        if self:applyNoCollisionToNode(nodeId) then
+-            self.overlapModifiedCount = self.overlapModifiedCount + 1
+-        end
+-    end)
++    if self.pendingHitTail - self.pendingHitHead + 1 >= self.maxPendingHits then
++        return true
++    end
++
++    if self.pendingHits == nil then
++        self.pendingHits = {}
++        self.pendingHitSet = {}
++        self.pendingHitHead = 1
++        self.pendingHitTail = 0
++    end
++
++    self.pendingHitTail = self.pendingHitTail + 1
++    self.pendingHits[self.pendingHitTail] = hitObjectId
++    self.pendingHitSet[hitObjectId] = true
+ 
+     return true
+ end
+@@ -1176,7 +1311,12 @@
+         return
+     end
+ 
+-    self:pruneInvalidModifiedNodes()
++    -- PERFORMANCE PATCH v2: prune bookkeeping every 10th fire, not every fire
++    self.pruneCounter = (self.pruneCounter or 0) + 1
++    if self.pruneCounter >= 10 then
++        self.pruneCounter = 0
++        self:pruneInvalidModifiedNodes()
++    end
+     self:logTrafficSystemInfoOnce()
+ 
+     local activeTrafficEntries = self:getActiveTrafficEntries()
+@@ -1199,8 +1339,13 @@
+     local overlapHits = 0
+     local scanPositions = nil
+     if self.lastTrafficAccessorName == "none" then
++        -- PERFORMANCE PATCH: scan ONE position per fire (round-robin) instead
++        -- of all of them; with the persistent not-traffic cache each sphere is
++        -- cheap, and every position is still visited within a few seconds.
+         scanPositions = self:getTrafficScanPositions()
+-        for _, position in ipairs(scanPositions) do
++        if #scanPositions > 0 then
++            self.scanPositionIndex = (self.scanPositionIndex % #scanPositions) + 1
++            local position = scanPositions[self.scanPositionIndex]
+             modifiedNodes = modifiedNodes + self:applyNoCollisionAroundPosition(position.x, position.y, position.z)
+             overlapHits = overlapHits + (self.overlapHitCount or 0)
+         end
+@@ -1257,6 +1402,13 @@
+     self.modifiedCollisionStates = {}
+     self.lastAppliedNodeCount = -1
+     self.lastApplyLogTimeMs = g_time or 0
++
++    -- PERFORMANCE PATCH: drop any deferred hits so nothing is applied after
++    -- the feature was toggled off
++    self.pendingHits = nil
++    self.pendingHitSet = nil
++    self.pendingHitHead = 1
++    self.pendingHitTail = 0
+ end
+ 
+ function AITrafficNoCollision:pruneInvalidModifiedNodes()

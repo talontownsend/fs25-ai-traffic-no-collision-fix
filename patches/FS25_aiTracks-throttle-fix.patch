@@ -1,0 +1,17 @@
+--- a/scripts/aiGround.lua
++++ b/scripts/aiGround.lua
+@@ -114,8 +114,12 @@
+ function AIGroundDeformation:update(dt)
+     if not g_currentMission or not g_currentMission.vehicles then return end
+     
+-    lastCheckTime = lastCheckTime + (dt or 0.016)
+-    if lastCheckTime < (SETTINGS.CHECK_INTERVAL / 1000) then return end
++    -- FIX: dt is in MILLISECONDS in FS25; the original compared an
++    -- ms-accumulator against a seconds value (0.15), so the throttle tripped
++    -- every frame and the full vehicle scan ran per-frame instead of every
++    -- CHECK_INTERVAL (150 ms).
++    lastCheckTime = lastCheckTime + (dt or 16)
++    if lastCheckTime < SETTINGS.CHECK_INTERVAL then return end
+     lastCheckTime = 0
+ 
+     -- Limpiar tabla de procesados periódicamente
