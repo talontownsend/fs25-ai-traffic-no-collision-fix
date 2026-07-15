@@ -1,46 +1,35 @@
-# Applies a performance patch to YOUR OWN locally-downloaded copy of a mod zip.
-# No mod files are distributed by this repository - this script edits the copy
-# you already have (a backup is created next to it first).
+# Applies this repository's fix to YOUR OWN locally-downloaded copy of the mod
+# zip. No mod files are distributed here - this edits the copy you already
+# have (a backup is created next to it first).
 #
 # Usage (from the repo root, in PowerShell):
-#   .\tools\Apply-Patch.ps1 -Mod aiTracks
-#   .\tools\Apply-Patch.ps1 -Mod AITrafficNoCollision
-#   .\tools\Apply-Patch.ps1 -Mod aiTracks -ZipPath "D:\path\to\FS25_aiTracks.zip"
+#   .\tools\Apply-Patch.ps1
+#   .\tools\Apply-Patch.ps1 -ZipPath "D:\path\to\FS25_AITrafficNoCollision.zip"
 #
-# The patch only applies to the exact mod version it was written for
-# (aiTracks v2.2.0.0 / AITrafficNoCollision v1.0.0.0). If the author has
-# released a newer version, the script stops without changing anything.
+# The patch only applies to the exact mod version it was written for; on any
+# other version the script stops without changing anything.
 
-param(
-    [Parameter(Mandatory = $true)]
-    [ValidateSet('aiTracks', 'AITrafficNoCollision')]
-    [string]$Mod,
-
-    [string]$ZipPath
-)
+param([string]$ZipPath)
 
 $ErrorActionPreference = 'Stop'
-
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$hunksFile = Join-Path $repoRoot ("patches\FS25_" + $Mod + "-hunks.json")
+$hunksFile = Join-Path $repoRoot 'patches\FS25_AITrafficNoCollision-hunks.json'
 if (-not (Test-Path -LiteralPath $hunksFile)) { throw "hunks file not found: $hunksFile" }
 
 if (-not $ZipPath) {
     $myGames = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'My Games\FarmingSimulator2025\mods'
-    $ZipPath = Join-Path $myGames ("FS25_" + $Mod + ".zip")
+    $ZipPath = Join-Path $myGames 'FS25_AITrafficNoCollision.zip'
 }
 if (-not (Test-Path -LiteralPath $ZipPath)) { throw "mod zip not found: $ZipPath (pass -ZipPath)" }
 
 $spec = Get-Content -LiteralPath $hunksFile -Raw | ConvertFrom-Json
 
-# backup
 $backup = "$ZipPath.pre-patch.bak"
 if (-not (Test-Path -LiteralPath $backup)) {
     Copy-Item -LiteralPath $ZipPath -Destination $backup
     Write-Host "backup created: $backup"
 }
 
-# extract to temp
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ("modpatch_" + [System.IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $work | Out-Null
 try {
@@ -58,7 +47,7 @@ try {
             $norm = $text -replace "`r`n", "`n"
             $idx = $norm.IndexOf($old, [System.StringComparison]::Ordinal)
             if ($idx -lt 0) {
-                throw "hunk $($n + 1) for $($file.path) did not match - the mod version differs from the one this patch targets. Nothing was changed (delete the .bak if you want to keep it anyway)."
+                throw "hunk $($n + 1) for $($file.path) did not match - the mod version differs from the one this patch targets. Nothing was changed."
             }
             $text = $norm.Remove($idx, $old.Length).Insert($idx, $new)
             $n++
@@ -67,7 +56,6 @@ try {
         Write-Host "patched $($file.path): $n hunk(s)"
     }
 
-    # rebuild zip in place
     Remove-Item -LiteralPath $ZipPath -Force
     $items = Get-ChildItem -LiteralPath $work | ForEach-Object { $_.FullName }
     Compress-Archive -Path $items -DestinationPath $ZipPath -Force

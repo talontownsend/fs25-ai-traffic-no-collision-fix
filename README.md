@@ -1,105 +1,78 @@
-# FS25 Mod Performance Patches
+# FS25 "AI Traffic No Collision" — periodic stutter fix
 
-Tested performance fixes for two popular Farming Simulator 25 mods, offered to their authors
-for adoption — published here as **patches you apply to your own downloaded copy**. This
-repository distributes **no mod files**: only diffs, an apply script, and the measurement data.
+A tested performance fix for the [AI Traffic No Collision](https://www.farming-simulator.com/mod.php?mod_id=352720)
+mod (v1.0.0.0, by Huxinator) for Farming Simulator 25, offered to the author for adoption —
+published here as a **patch you apply to your own downloaded copy**. This repository distributes
+**no mod files**.
 
-| Mod | Author | Issue | Result |
-| --- | --- | --- | --- |
-| AI Traffic No Collision v1.0.0.0 | Huxinator | ~24 ms main-thread stall every 1.009 s | 597 → ~0 stutter events / 10 min |
-| True AI Tracks v2.2.0.0 | KCHARRO | throttle bug → full vehicle scan every frame | ≈ +0.6 ms/frame back (+1.8 fps with 3 helpers) |
+## The problem
 
-Both mods are ModHub-only releases without public repositories, so these fixes can't be
-submitted as pull requests. They have been offered directly to both authors — if either ships
-an official update containing a fix, use that and delete these patches.
+The mod causes a metronomic ~24 ms main-thread stall every **1.009 seconds** (its 1000 ms scan
+timer plus the discarded frame remainder). Measured with CapFrameX: **597 stutter events in a
+10-minute capture**. Users report the same on ModHub ("fps drops every ~2 seconds") and in the
+mod's [GIANTS forum thread](https://forum.giants-software.com/viewtopic.php?t=218044). Because
+the stall is CPU-side, no graphics setting, DLSS, or frame generation helps.
 
-## Applying a patch
+**Root cause** — every second the mod re-derives the traffic set from scratch:
 
-You need the mod already installed from the official ModHub (the exact versions above).
-
-```powershell
-git clone https://github.com/talontownsend/fs25-mod-performance-patches
-cd fs25-mod-performance-patches
-.\tools\Apply-Patch.ps1 -Mod aiTracks
-.\tools\Apply-Patch.ps1 -Mod AITrafficNoCollision
-```
-
-The script backs up your original zip next to itself (`*.pre-patch.bak`), verifies every hunk
-matches the expected mod version (it refuses to touch anything else), edits the scripts inside
-your copy, and rebuilds the zip in place.
-
-**Notes**
-- Decline ModHub update prompts for patched mods, or the patch is overwritten (that's also how
-  you *adopt* an official fix later — just accept the update).
-- Patched zips have a different hash than ModHub's: fine in singleplayer; multiplayer requires
-  all players (and the server) to use the same zip.
-- If your mods folder is in a non-default location, pass `-ZipPath`.
-
-## Fix 1: AI Traffic No Collision — periodic stutter
-
-**Symptom.** A metronomic ~24 ms main-thread block every 1.009 s (the mod's 1000 ms scan timer
-plus the discarded frame remainder). CapFrameX: 597 stutter events in 10 minutes; also reported
-by ModHub reviewers ("fps drops every ~2 seconds") and in the mod's GIANTS forum thread.
-
-**Root cause.** Every second the mod re-derived the traffic set from scratch:
 1. `overlapSphere` with `CollisionMask.ALL` at 90 m around up to 3 positions returns *every
-   shape nearby* (often thousands); each hit costs a C++→Lua callback invocation even when
+   shape nearby* (often thousands); every hit costs a C++→Lua callback invocation even when
    rejected.
-2. Rejected static geometry was re-classified every scan, forever (`overlapVisitedNodes` reset
-   per scan), using name searches and recursive child scans.
-3. All scan positions were processed within a single frame.
+2. Rejected static geometry (fences, buildings, rocks) is re-classified from scratch every
+   scan, forever — nothing is remembered between scans.
+3. All scan positions are processed inside a single frame.
 
-**Fix** (`patches/FS25_AITrafficNoCollision-performance.patch`) — detection semantics unchanged:
-- query the overlap with the mod's own vehicle/traffic collision flags (dozens of hits instead
-  of thousands); `CollisionMask.ALL` kept as fallback where flags are unavailable
-- persistent "not traffic" verdict cache (reset every 2 min for engine node-id recycling)
+## The fix
+
+Four changes, **detection semantics unchanged** (same classification logic, same collision
+masks, same settings UI):
+
+- query the overlap with the mod's own vehicle/traffic collision flags, so the engine returns
+  dozens of hits instead of thousands (`CollisionMask.ALL` kept as fallback)
+- persistent "not traffic" verdict cache (reset every 2 min to tolerate engine node-id reuse)
 - per-hit classification deferred to a 24-hits-per-frame budget
 - one scan position per fire (round-robin), memoized per-vehicle classification, throttled
   bookkeeping
 
-**Measured** (10-minute CapFrameX captures, same save/scenario):
+## Measured results
 
-| build | metronomic events | spike cost | p99 frametime |
+10-minute CapFrameX captures, same savegame and scenario (Riverbend Springs, AI helpers active):
+
+| build | metronomic stutter events | spike cost | p99 frametime |
 | --- | --- | --- | --- |
-| original | 597 | ~26 ms | 41–53 ms |
-| + cache/defer/round-robin | 188 | ~13 ms | 29 ms |
+| v1.0.0.0 original | 597 | ~26 ms | 41–53 ms |
+| + cache / deferral / round-robin | 188 | ~13 ms | 29 ms |
 | + targeted overlap mask | **10 (aperiodic)** | — | **27 ms** |
 
-Functionality verified in-game after each step: AI traffic still passes through / yields to
-player and AI vehicles.
+Functionality verified in-game after each step: AI traffic still doesn't collide with player or
+AI vehicles.
 
-## Fix 2: True AI Tracks — every-frame scan
+## Applying the patch
 
-**Symptom.** Constant per-frame cost that grows with vehicle count (worst with several AI
-helpers running).
+Requires the mod already installed from the official ModHub (v1.0.0.0).
 
-**Root cause.** `scripts/aiGround.lua` accumulates FS25's **millisecond** `dt` but compares it
-against `CHECK_INTERVAL / 1000` (= `0.15`), so the 150 ms throttle trips on the first frame,
-every frame — the full `g_currentMission.vehicles` scan with recursive implement processing
-runs ~50× more often than intended.
+```powershell
+git clone https://github.com/talontownsend/fs25-ai-traffic-no-collision-fix
+cd fs25-ai-traffic-no-collision-fix
+.\tools\Apply-Patch.ps1
+```
 
-**Fix** (`patches/FS25_aiTracks-throttle-fix.patch`): compare milliseconds to milliseconds.
+The script backs up your zip (`*.pre-patch.bak`), verifies every hunk matches the expected mod
+version (any mismatch aborts without changes), edits the script inside your copy, and rebuilds
+the zip in place. Decline ModHub update prompts afterwards, or the patch is overwritten — which
+is also how you adopt an official fix later: just accept the update.
 
-**Measured** (10-minute captures, same scenario, 2–3 AI helpers): median frametime
-19.27 → 18.67 ms, average 50.8 → 52.6 fps. Track visuals unchanged (the scan still runs at the
-author's intended 150 ms cadence). The companion mods (NEXAT / CRAWLERS) contain no periodic
-code and need no changes.
-
-## Methodology
-
-Frame-time data captured with [CapFrameX](https://www.capframex.com/) (10-minute PresentMon
-captures), analyzed for spike cadence (inter-event interval histograms) and per-frame
-CPU/GPU-busy attribution. The 1.009 s fingerprint — 1000 ms timer + discarded frame remainder
-at ~50 fps — is what identified the scan timer from the capture data alone.
+Patched zips hash differently than ModHub's: fine in singleplayer; multiplayer requires all
+players and the server to use the same zip.
 
 ## Rights & takedown
 
-The mods remain the property of their authors (Huxinator; KCHARRO / "True AI Tracks"). The
-diffs contain the minimal code fragments needed to describe and apply the fixes — standard
-bug-report practice. Nothing here enables using a mod you haven't downloaded from the official
-ModHub yourself. **If you are one of the authors and want anything here changed or removed,
-open an issue and it will be done promptly** — the goal of this repository is to get these
-fixes into your official releases, nothing more.
+The mod remains the property of its author, Huxinator. The patch contains the minimal code
+fragments needed to describe and apply the fix — standard bug-report practice — and nothing
+here enables using the mod without downloading it from the official ModHub yourself. **If you
+are the author and want anything changed or removed, open an issue and it will be done
+promptly.** The goal of this repository is to get the fix into your official release, nothing
+more.
 
-The apply script and documentation are MIT-licensed (see LICENSE). The `.patch` files include
-fragments of the respective authors' code, which remain under their rights.
+The apply script and documentation are MIT-licensed (see LICENSE); the patch files include
+fragments of the author's code, which remain under their rights.

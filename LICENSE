@@ -4,7 +4,7 @@ Copyright (c) 2026 talontownsend
 
 Applies to the apply script (tools/) and documentation in this repository.
 The .patch and -hunks.json files contain fragments of third-party mod code
-(AI Traffic No Collision by Huxinator; True AI Tracks by KCHARRO) included
+(AI Traffic No Collision by Huxinator) included
 solely to describe and apply bug fixes; those fragments remain the property
 of their respective authors and are not covered by this license.
 
